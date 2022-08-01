@@ -17,6 +17,7 @@
     return EXIT_FAILURE;}} while(0)
 
 #define EXP_TIMES 100
+#define DATA_BLOCK 1024
 
 using namespace std;
 
@@ -28,16 +29,25 @@ __global__ void moro_inv(float* data, int cnt, float mean, float std) {
     data[Idx] = normcdfinvf(data[Idx]) * std + mean;
 }
 
+__global__ void moro_inv_v2(float* data, int cnt, float mean, float std) {
+    // Each thread will handle DATA_BLOCK transfer
+    size_t Idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (Idx >= cnt) return;
+
+    float* data_p = &data[Idx * DATA_BLOCK];
+
+    for (int i = 0; i < DATA_BLOCK; i++) {
+        data_p[i] = normcdfinvf(data_p[i]) * std + mean;
+    }
+    
+}
+
 int main()
 {
     int m = 1 << 12;
     int n = 1 << 12;    // Test with 16M data, generate (4k * 4k) sobol sequence
-
-    //allocate host memory
-    /*size_t bytes = size * sizeof(int);
-    int* idata_host = (int*)malloc(bytes);
-    int* odata_host = (int*)malloc(grid.x * sizeof(int));
-    int* tmp = (int*)malloc(bytes);*/
+    cout << "Demension M: " << m << endl;
+    cout << "Count N: " << n << endl;
 
     // Allocate memory
     size_t bytes = m * n * sizeof(float);
@@ -51,15 +61,16 @@ int main()
     CUDA_CALL(cudaMalloc((void**)&comb_dev, bytes));
 
     // Generator
-    
     int offset = 1024;
 
+    // Single run for correction check and warm-up
     // Seperate 
     // Set up block manually
     int blocksize = 1024;
     dim3 block(blocksize, 1);
-    dim3 grid((m * n - 1) / block.x + 1, 1);
-    printf("grid %d block %d \n", grid.x, block.x);
+    dim3 grid_v1((m * n - 1) / block.x + 1, 1);
+    dim3 grid_v2((m * n - 1) / (block.x * DATA_BLOCK) + 1, 1);
+    printf("grid_v1 %d grid_v2 %d block %d \n", grid_v1.x, grid_v2.x, block.x);
 
     chrono::steady_clock::time_point start, end;
     start = chrono::steady_clock::now();
@@ -68,12 +79,13 @@ int main()
     CURAND_CALL(curandSetGeneratorOffset(gen_sepr, offset));
     CURAND_CALL(curandSetQuasiRandomGeneratorDimensions(gen_sepr, m));
     CURAND_CALL(curandGenerateUniform(gen_sepr, sepr_dev, n * m));
-    moro_inv << < grid, block >> > (sepr_dev, m * n, 0, 0.5);
+    //moro_inv << < grid_v1, block >> > (sepr_dev, m * n, 0, 0.5);
+    moro_inv_v2 << < grid_v2, block >> > (sepr_dev, m * n, 0, 0.5);
     cudaDeviceSynchronize();
     end = chrono::steady_clock::now();
     chrono::duration<double, std::milli> elapsed = end - start;
 
-    cout << "Seperated version EXE TIME: " << elapsed.count() << "ms" << endl;
+    //cout << "Seperated version EXE TIME: " << elapsed.count() << "ms" << endl;
 
     CUDA_CALL(cudaMemcpy(sepr_host, sepr_dev, bytes, cudaMemcpyDeviceToHost));
     CUDA_CALL(curandDestroyGenerator(gen_sepr));
@@ -89,7 +101,7 @@ int main()
     end = chrono::steady_clock::now();
     elapsed = end - start;
 
-    cout << "Combined version EXE TIME: " << elapsed.count() << "ms" << endl;
+    //cout << "Combined version EXE TIME: " << elapsed.count() << "ms" << endl;
 
 
     CUDA_CALL(cudaMemcpy(comb_host, comb_dev, bytes, cudaMemcpyDeviceToHost));
@@ -115,12 +127,13 @@ int main()
         cout << "CORRECTION CHECK: PASS" << endl;
 
         // loop to get average time
-        double sepr_time = 0;
+        double sepr_time1 = 0;
+        double sepr_time2 = 0;
         double comb_time = 0;
 
         for (int i = 0; i < EXP_TIMES; i++) {
             
-            // Seperated
+            // Seperated_v1
             // ------------------------
             start = chrono::steady_clock::now();
 
@@ -128,13 +141,30 @@ int main()
             CURAND_CALL(curandSetGeneratorOffset(gen_sepr, offset));
             CURAND_CALL(curandSetQuasiRandomGeneratorDimensions(gen_sepr, m));
             CURAND_CALL(curandGenerateUniform(gen_sepr, sepr_dev, n * m));
-            moro_inv << < grid, block >> > (sepr_dev, m * n, 0, 0.5);
+            moro_inv << < grid_v1, block >> > (sepr_dev, m * n, 0, 0.5);
             cudaDeviceSynchronize();
             CUDA_CALL(curandDestroyGenerator(gen_sepr));
 
             end = chrono::steady_clock::now();
             elapsed = end - start;
-            sepr_time += elapsed.count();
+            sepr_time1 += elapsed.count();
+            // ------------------------
+
+            // Seperated_v2
+            // ------------------------
+            start = chrono::steady_clock::now();
+
+            CURAND_CALL(curandCreateGenerator(&gen_sepr, CURAND_RNG_QUASI_SOBOL32));
+            CURAND_CALL(curandSetGeneratorOffset(gen_sepr, offset));
+            CURAND_CALL(curandSetQuasiRandomGeneratorDimensions(gen_sepr, m));
+            CURAND_CALL(curandGenerateUniform(gen_sepr, sepr_dev, n * m));
+            moro_inv_v2 << < grid_v2, block >> > (sepr_dev, m * n, 0, 0.5);
+            cudaDeviceSynchronize();
+            CUDA_CALL(curandDestroyGenerator(gen_sepr));
+
+            end = chrono::steady_clock::now();
+            elapsed = end - start;
+            sepr_time2 += elapsed.count();
             // ------------------------
             
 
@@ -152,7 +182,8 @@ int main()
             // ------------------------
         }
 
-        cout << "Seperated version average EXE TIME: " << sepr_time / EXP_TIMES << "ms" << endl;;
+        cout << "Seperated version 1 average EXE TIME: " << sepr_time1 / EXP_TIMES << "ms" << endl;;
+        cout << "Seperated version 2 average EXE TIME: " << sepr_time2 / EXP_TIMES << "ms" << endl;;
         cout << "Combined version average EXE TIME: " << comb_time / EXP_TIMES << "ms" << endl;;
     }  
 
